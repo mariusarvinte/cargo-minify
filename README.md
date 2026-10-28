@@ -8,6 +8,11 @@ bindgen), but also usable in more general context.
 Public functions and types in libraries (which makes sense) but also in binaries and examples are not considered unused,
 as well as code that is explicitly allowed to be unused (using `#[allow(unused)]`).
 
+Only the library target is minified, and only code unused both with and without `cfg(test)` is removed. Binaries,
+examples and integration tests are left untouched.
+
+Removing a function does not remove the `use` declarations that import it.
+
 ## Installation
 
 ```shell

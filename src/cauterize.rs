@@ -3,12 +3,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use syn::{spanned::Spanned, File};
+use syn::{
+    ext::IdentExt,
+    spanned::Spanned,
+    visit::{self, Visit},
+    File,
+};
 
 use crate::unused::{UnusedDiagnostic, UnusedDiagnosticKind};
 
 const SPACE: u8 = b' ';
 const NEWLINE: u8 = b'\n';
+const CARRIAGE_RETURN: u8 = b'\r';
 
 pub struct Change {
     file_name: PathBuf,
@@ -51,108 +57,96 @@ fn find_prefix_whitespace(src: &[u8]) -> usize {
 /// - if there is no newline, eat all trailing whitespace until the next token
 fn find_suffix_whitespace(src: &[u8]) -> usize {
     src.iter()
-        .position(|c| *c != SPACE)
+        .position(|c| *c != SPACE && *c != CARRIAGE_RETURN)
         .map(|pos| if src[pos] == NEWLINE { pos + 1 } else { pos })
         .unwrap_or(src.len())
 }
 
-/// Turns a list of "locations of identifiers" into a list of "chunks"
+/// Turns a list of "locations of identifiers" into a list of "chunks"; an
+/// identifier with a known byte offset only matches the item declared there
 fn diagnostics_to_ranges<'a>(
     src: &'a [u8],
-    idents: impl IntoIterator<Item = (UnusedDiagnosticKind, String)> + 'a,
+    idents: impl IntoIterator<Item = (UnusedDiagnosticKind, String, Option<usize>)> + 'a,
 ) -> Result<impl Iterator<Item = Range<usize>> + 'a, syn::Error> {
     let s = String::from_utf8_lossy(src);
     let parsed = syn::parse_str::<syn::File>(&s)?;
 
     let cumulative_lengths = line_offsets(src);
+    let mut items = Items::default();
+    items.visit_file(&parsed);
 
-    let ranges = idents
+    let ranges: Vec<_> = idents
         .into_iter()
-        .flat_map(move |(kind, ident)| {
-            parsed.items.iter().find_map(|item| {
-                use syn::{ForeignItem, ImplItem, Item};
-                use UnusedDiagnosticKind::*;
-                let item_ident = match item {
-                    Item::Const(obj) if kind == Constant => &obj.ident,
-                    Item::Enum(obj) if kind == Enum => &obj.ident,
-                    Item::Fn(obj) if kind == Function => &obj.sig.ident,
-                    Item::Macro(syn::ItemMacro {
-                        ident: Some(name), ..
-                    }) if kind == MacroDefinition => name,
-                    Item::Static(obj) if kind == Static => &obj.ident,
-                    Item::Struct(obj) if kind == Struct => &obj.ident,
-                    Item::Type(obj) if kind == TypeAlias => &obj.ident,
-                    Item::Union(obj) if kind == Union => &obj.ident,
-                    Item::Mod(block) => return handle_mod_diagnostic(block, &kind, &ident),
-                    Item::ForeignMod(block) => {
-                        return block.items.iter().find_map(|item| {
-                            let item_ident = match item {
-                                ForeignItem::Fn(obj) if kind == Function => &obj.sig.ident,
-                                ForeignItem::Static(obj) if kind == Static => &obj.ident,
-                                ForeignItem::Type(obj) if kind == TypeAlias => &obj.ident,
-                                _ => return None,
-                            };
-
-                            if *item_ident == ident {
-                                Some(item.span())
-                            } else {
-                                None
-                            }
-                        })
-                    }
-                    Item::Impl(block) => {
-                        return block.items.iter().find_map(|item| {
-                            let item_ident = match item {
-                                ImplItem::Const(obj) if kind == Constant => &obj.ident,
-                                ImplItem::Fn(obj) if kind == AssociatedFunction => &obj.sig.ident,
-                                ImplItem::Type(obj) if kind == TypeAlias => &obj.ident,
-                                _ => return None,
-                            };
-
-                            if *item_ident == ident {
-                                Some(item.span())
-                            } else {
-                                None
-                            }
-                        })
-                    }
-                    _ => return None,
-                };
-
-                if *item_ident == ident {
-                    Some(item.span())
-                } else {
-                    None
-                }
+        .filter_map(|(kind, ident, at)| {
+            items.0.iter().find_map(|(item_kind, item_ident, span)| {
+                let start = || to_offset(&s, &cumulative_lengths, item_ident.span().start());
+                (*item_kind == kind
+                    && item_ident.unraw() == ident
+                    && at.is_none_or(|at| start() == at))
+                .then(|| to_range(&s, &cumulative_lengths, *span))
             })
         })
-        .map(move |span| to_range(&cumulative_lengths, span));
+        .collect();
 
-    Ok(ranges)
+    Ok(ranges.into_iter())
 }
 
-/// Handles (inline) module content
-fn handle_mod_diagnostic(block: &syn::ItemMod, kind: &UnusedDiagnosticKind, ident: &str) -> Option<proc_macro2::Span> {
-    use syn::Item;
-    use UnusedDiagnosticKind::*;
+/// Every removable item in a file, wherever it is nested, in source order
+#[derive(Default)]
+struct Items<'ast>(Vec<(UnusedDiagnosticKind, &'ast syn::Ident, proc_macro2::Span)>);
 
-    block.content.iter().find_map(|(_b, items)| {
-        items.iter().find_map(|item| {
-            let item_ident = match item {
-                Item::Fn(obj) if *kind == Function => &obj.sig.ident,
-                Item::Static(obj) if *kind == Static => &obj.ident,
-                Item::Type(obj) if *kind == TypeAlias => &obj.ident,
-                Item::Mod(obj) => return handle_mod_diagnostic(obj, kind, ident),
-                _ => return None,
-            };
+impl<'ast> Visit<'ast> for Items<'ast> {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        use syn::Item;
+        use UnusedDiagnosticKind::*;
+        let found = match item {
+            Item::Const(obj) => Some((Constant, &obj.ident)),
+            Item::Enum(obj) => Some((Enum, &obj.ident)),
+            Item::Fn(obj) => Some((Function, &obj.sig.ident)),
+            Item::Macro(syn::ItemMacro {
+                ident: Some(name), ..
+            }) => Some((MacroDefinition, name)),
+            Item::Static(obj) => Some((Static, &obj.ident)),
+            Item::Struct(obj) => Some((Struct, &obj.ident)),
+            Item::Type(obj) => Some((TypeAlias, &obj.ident)),
+            Item::Union(obj) => Some((Union, &obj.ident)),
+            _ => None,
+        };
+        if let Some((kind, ident)) = found {
+            self.0.push((kind, ident, item.span()));
+        }
+        visit::visit_item(self, item);
+    }
 
-            if item_ident == ident {
-                Some(item.span())
-            } else {
-                None
-            }
-        })
-    })
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        use syn::ForeignItem;
+        use UnusedDiagnosticKind::*;
+        let found = match item {
+            ForeignItem::Fn(obj) => Some((Function, &obj.sig.ident)),
+            ForeignItem::Static(obj) => Some((Static, &obj.ident)),
+            ForeignItem::Type(obj) => Some((TypeAlias, &obj.ident)),
+            _ => None,
+        };
+        if let Some((kind, ident)) = found {
+            self.0.push((kind, ident, item.span()));
+        }
+        visit::visit_foreign_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        use syn::ImplItem;
+        use UnusedDiagnosticKind::*;
+        let found = match item {
+            ImplItem::Const(obj) => Some((Constant, &obj.ident)),
+            ImplItem::Fn(obj) => Some((AssociatedFunction, &obj.sig.ident)),
+            ImplItem::Type(obj) => Some((TypeAlias, &obj.ident)),
+            _ => None,
+        };
+        if let Some((kind, ident)) = found {
+            self.0.push((kind, ident, item.span()));
+        }
+        visit::visit_impl_item(self, item);
+    }
 }
 
 fn expand_ranges_to_include_whitespace<'a>(
@@ -186,7 +180,7 @@ pub fn delete_chunks(src: &[u8], chunks_to_delete: &[Range<usize>]) -> Vec<u8> {
 /// delete identifiers there ...  probably?
 pub fn rust_delete(
     src: &[u8],
-    diagnostics: impl IntoIterator<Item = (UnusedDiagnosticKind, String)>,
+    diagnostics: impl IntoIterator<Item = (UnusedDiagnosticKind, String, Option<usize>)>,
 ) -> Result<Vec<u8>, syn::Error> {
     let chunks_to_delete =
         expand_ranges_to_include_whitespace(src, diagnostics_to_ranges(src, diagnostics)?);
@@ -205,7 +199,10 @@ fn process_files<Iter: IntoIterator<Item = UnusedDiagnostic>>(
             let original_content = std::fs::read(&file_name).ok()?;
             let removed_unused = rust_delete(
                 &original_content,
-                diagnostic.into_iter().map(|warn| (warn.kind, warn.ident)),
+                diagnostic.into_iter().map(|warn| {
+                    let at = warn.span.byte_start as usize;
+                    (warn.kind, warn.ident, Some(at))
+                }),
             )
             .expect("syntax error");
             let proposed_content = remove_empty_blocks(&removed_unused).expect("syntax error");
@@ -253,10 +250,20 @@ fn line_offsets(bytes: &[u8]) -> Vec<usize> {
     offsets
 }
 
-fn to_range(offsets: &[usize], span: proc_macro2::Span) -> Range<usize> {
-    let byte_offset = |pos: proc_macro2::LineColumn| offsets[pos.line - 1] + pos.column;
+/// Columns count characters, not bytes
+fn to_offset(src: &str, offsets: &[usize], pos: proc_macro2::LineColumn) -> usize {
+    let line = offsets[pos.line - 1];
+    let column: usize = src[line..]
+        .chars()
+        .take(pos.column)
+        .map(char::len_utf8)
+        .sum();
 
-    byte_offset(span.start())..byte_offset(span.end())
+    line + column
+}
+
+fn to_range(src: &str, offsets: &[usize], span: proc_macro2::Span) -> Range<usize> {
+    to_offset(src, offsets, span.start())..to_offset(src, offsets, span.end())
 }
 
 fn remove_empty_blocks(bytes: &[u8]) -> Result<Vec<u8>, syn::Error> {
@@ -278,7 +285,7 @@ fn remove_empty_blocks(bytes: &[u8]) -> Result<Vec<u8>, syn::Error> {
             }
             _ => None,
         })
-        .map(|span| to_range(&cumulative_lengths, span));
+        .map(|span| to_range(&s, &cumulative_lengths, span));
 
     let expanded_spans: Vec<Range<usize>> =
         expand_ranges_to_include_whitespace(bytes, spans).collect();
@@ -306,12 +313,12 @@ pub fn commit_changes(
 mod test {
     use super::*;
 
-    fn fun(name: &str) -> (UnusedDiagnosticKind, String) {
-        (UnusedDiagnosticKind::Function, name.to_owned())
+    fn fun(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (UnusedDiagnosticKind::Function, name.to_owned(), None)
     }
 
-    fn constant(name: &str) -> (UnusedDiagnosticKind, String) {
-        (UnusedDiagnosticKind::Constant, name.to_owned())
+    fn constant(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (UnusedDiagnosticKind::Constant, name.to_owned(), None)
     }
 
     #[test]

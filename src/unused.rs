@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt::{Display, Formatter},
     io::BufReader,
     path::Path,
@@ -13,54 +14,68 @@ use cargo_metadata::{
 
 use crate::{error::Result, resolver, CrateResolutionOptions, FileResolutionOptions};
 
-pub fn get_unused<'a>(
+/// Only the library target is minified. It is checked twice, once as is and
+/// once with `cfg(test)`, and an item counts as unused only if both builds
+/// agree: code used solely by unit tests, or solely outside them, is kept.
+pub fn get_unused(
     manifest_path: Option<&Path>,
     crate_resolution: &CrateResolutionOptions,
-    file_resolution: &'a FileResolutionOptions,
-    kinds: &'a [UnusedDiagnosticKind],
-) -> Result<impl Iterator<Item = UnusedDiagnostic> + 'a> {
-    let mut command = Command::new("cargo");
-
-    command.args(["check", "--all-targets", "--quiet", "--message-format", "json"]);
-
-    match crate_resolution {
-        CrateResolutionOptions::Root => {}
-        CrateResolutionOptions::Workspace { exclude } => {
-            command.arg("--workspace");
-
-            for package in *exclude {
-                command.args(["--exclude", package]);
-            }
-        }
-        CrateResolutionOptions::Package { packages } => {
-            for package in *packages {
-                command.args(["-p", package]);
-            }
-        }
-    }
-
-    let mut child = command.stdout(Stdio::piped()).spawn()?;
-    let stdout = child.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
-
+    file_resolution: &FileResolutionOptions,
+    kinds: &[UnusedDiagnosticKind],
+) -> Result<impl Iterator<Item = UnusedDiagnostic>> {
     let targets = resolver::get_targets(manifest_path, crate_resolution)?;
+    let check = |profile: &str| -> Result<Vec<UnusedDiagnostic>> {
+        let mut command = Command::new("cargo");
 
-    let unused = Message::parse_stream(reader)
-        .flatten()
-        .filter_map(|message| {
-            if let Message::CompilerMessage(message) = message {
-                Some(message)
-            } else {
-                None
+        command.args(["check", "--lib", "--profile", profile]);
+        command.args(["--quiet", "--message-format", "json"]);
+
+        match crate_resolution {
+            CrateResolutionOptions::Root => {}
+            CrateResolutionOptions::Workspace { exclude } => {
+                command.arg("--workspace");
+
+                for package in *exclude {
+                    command.args(["--exclude", package]);
+                }
             }
-        })
-        .filter(move |message| targets.contains(&message.target))
-        .map(|message| message.message)
-        .filter_map(|diagnostic| UnusedDiagnostic::try_from(diagnostic).ok())
-        // Ignore unused warnings originating from macro expansions
-        .filter(|diagnostic| diagnostic.span.expansion.is_none())
-        .filter(|diagnostic| kinds.is_empty() || kinds.contains(&diagnostic.kind))
-        .filter(|diagnostic| file_resolution.is_included(&diagnostic.span.file_name));
+            CrateResolutionOptions::Package { packages } => {
+                for package in *packages {
+                    command.args(["-p", package]);
+                }
+            }
+        }
+
+        let mut child = command.stdout(Stdio::piped()).spawn()?;
+        let stdout = child.stdout.take().unwrap();
+        let reader = BufReader::new(stdout);
+
+        let unused = Message::parse_stream(reader)
+            .flatten()
+            .filter_map(|message| {
+                if let Message::CompilerMessage(message) = message {
+                    Some(message)
+                } else {
+                    None
+                }
+            })
+            .filter(|message| targets.contains(&message.target))
+            .map(|message| message.message)
+            .filter_map(|diagnostic| UnusedDiagnostic::try_from(diagnostic).ok())
+            // Ignore unused warnings originating from macro expansions
+            .filter(|diagnostic| diagnostic.span.expansion.is_none())
+            .filter(|diagnostic| kinds.is_empty() || kinds.contains(&diagnostic.kind))
+            .filter(|diagnostic| file_resolution.is_included(&diagnostic.span.file_name))
+            .collect();
+        child.wait()?;
+
+        Ok(unused)
+    };
+
+    let in_tests: HashSet<_> = check("test")?.iter().map(UnusedDiagnostic::key).collect();
+    let unused = check("dev")?
+        .into_iter()
+        .filter(move |diagnostic| in_tests.contains(&diagnostic.key()));
 
     Ok(unused)
 }
@@ -70,6 +85,12 @@ pub struct UnusedDiagnostic {
     pub kind: UnusedDiagnosticKind,
     pub ident: String,
     pub span: DiagnosticSpan,
+}
+
+impl UnusedDiagnostic {
+    fn key(&self) -> (String, usize) {
+        (self.span.file_name.clone(), self.span.byte_start as usize)
+    }
 }
 
 impl TryFrom<Diagnostic> for UnusedDiagnostic {
@@ -132,7 +153,11 @@ impl TryFrom<Diagnostic> for UnusedDiagnostic {
                     return Err(NotUnusedDiagnostic);
                 }
 
-                let span = value.spans.into_iter().next().ok_or(NotUnusedDiagnostic)?;
+                let span = value
+                    .spans
+                    .into_iter()
+                    .find(|span| span.is_primary)
+                    .ok_or(NotUnusedDiagnostic)?;
 
                 Ok(UnusedDiagnostic { kind, ident, span })
             }
@@ -178,7 +203,11 @@ impl TryFrom<Diagnostic> for UnusedDiagnostic {
                     return Err(NotUnusedDiagnostic);
                 }
 
-                let span = value.spans.into_iter().next().ok_or(NotUnusedDiagnostic)?;
+                let span = value
+                    .spans
+                    .into_iter()
+                    .find(|span| span.is_primary)
+                    .ok_or(NotUnusedDiagnostic)?;
 
                 Ok(UnusedDiagnostic { kind, ident, span })
             }
